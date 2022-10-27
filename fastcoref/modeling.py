@@ -11,6 +11,7 @@ from datasets import Dataset
 import spacy
 from spacy.cli import download
 
+from cortxmodels.common.utils import batchify
 from fastcoref.coref_models.modeling_fcoref import FCorefModel
 from fastcoref.coref_models.modeling_lingmess import LingMessModel
 from fastcoref.utilities.util import set_seed, create_mention_to_antecedent, create_clusters, align_to_char_level, encode
@@ -69,6 +70,7 @@ class CorefModel(ABC):
         self.device = device
         self.seed = 42
         self._set_device()
+        spacy.require_gpu()
 
         config = AutoConfig.from_pretrained(self.model_name_or_path)
         self.max_segment_len = config.coref_head['max_segment_len']
@@ -119,13 +121,18 @@ class CorefModel(ABC):
         self.n_gpu = torch.cuda.device_count()
 
     def _create_dataset(self, texts):
-        logger.info(f'Tokenize {len(texts)} texts...')
+        #logger.info(f'Tokenize {len(texts)} texts...')
         # Save original text ordering for later use
+        dataset_dict = {'text': texts,'idx':range(len(texts))}
+        dataset_dict.update(encode(dataset_dict, self.tokenizer, self.nlp))
+        dataset = Dataset.from_dict(dataset_dict)
+        """
         dataset = Dataset.from_dict({'text': texts,'idx':range(len(texts))})
         dataset = dataset.map(
             encode, batched=True, batch_size=10000,
             fn_kwargs={'tokenizer': self.tokenizer, 'nlp': self.nlp}
         )
+        """
 
         return dataset
 
@@ -142,39 +149,40 @@ class CorefModel(ABC):
 
     def _inference(self, dataloader):
         self.model.eval()
-        logger.info(f"***** Running Inference on {len(dataloader.dataset)} texts *****")
-
+        #logger.info(f"***** Running Inference on {len(dataloader.dataset)} texts *****")
+        
         results = []
-        with tqdm(desc="Inference", total=len(dataloader.dataset)) as progress_bar:
-            for batch in dataloader:
-                texts = batch['text']
-                subtoken_map = batch['subtoken_map']
-                token_to_char = batch['offset_mapping']
-                idxs = batch['idx']
-                with torch.no_grad():
-                    outputs = self.model(batch, return_all_outputs=True)
+        #with tqdm(desc="Inference", total=len(dataloader.dataset)) as progress_bar:
+        
+        for batch in dataloader:
+            texts = batch['text']
+            subtoken_map = batch['subtoken_map']
+            token_to_char = batch['offset_mapping']
+            idxs = batch['idx']
+            with torch.no_grad():
+                outputs = self.model(batch, return_all_outputs=True)
 
-                outputs_np = tuple(tensor.cpu().numpy() for tensor in outputs)
+            outputs_np = tuple(tensor.cpu().numpy() for tensor in outputs)
 
-                span_starts, span_ends, mention_logits, coref_logits = outputs_np
-                doc_indices, mention_to_antecedent = create_mention_to_antecedent(span_starts, span_ends, coref_logits)
+            span_starts, span_ends, mention_logits, coref_logits = outputs_np
+            doc_indices, mention_to_antecedent = create_mention_to_antecedent(span_starts, span_ends, coref_logits)
 
-                for i in range(len(texts)):
-                    doc_mention_to_antecedent = mention_to_antecedent[np.nonzero(doc_indices == i)]
-                    predicted_clusters = create_clusters(doc_mention_to_antecedent)
+            for i in range(len(texts)):
+                doc_mention_to_antecedent = mention_to_antecedent[np.nonzero(doc_indices == i)]
+                predicted_clusters = create_clusters(doc_mention_to_antecedent)
 
-                    char_map, reverse_char_map = align_to_char_level(
-                        span_starts[i], span_ends[i], token_to_char[i], subtoken_map[i]
-                    )
+                char_map, reverse_char_map = align_to_char_level(
+                    span_starts[i], span_ends[i], token_to_char[i], subtoken_map[i]
+                )
 
-                    res = CorefResult(
-                        text=texts[i], clusters=predicted_clusters,
-                        char_map=char_map, reverse_char_map=reverse_char_map,
-                        coref_logit=coref_logits[i], text_idx=idxs[i]
-                    )
-                    results.append(res)
+                res = CorefResult(
+                    text=texts[i], clusters=predicted_clusters,
+                    char_map=char_map, reverse_char_map=reverse_char_map,
+                    coref_logit=coref_logits[i], text_idx=idxs[i]
+                )
+                results.append(res)
 
-                progress_bar.update(n=len(texts))
+            #progress_bar.update(n=len(texts))
 
         return sorted(results, key=lambda res: res.text_idx)
 
@@ -185,7 +193,6 @@ class CorefModel(ABC):
             is_str = True
         if not isinstance(texts, list):
             raise ValueError(f'texts argument expected to be a list of strings, or one single text string. provided {type(texts)}')
-
         dataset = self._create_dataset(texts=texts)
         dataloader = self._prepare_batches(dataset, max_tokens_in_batch)
 
